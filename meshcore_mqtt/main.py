@@ -8,7 +8,7 @@ from typing import Optional
 
 import click
 
-from .config import Config, ConnectionType
+from .config import Config, ConnectionType, PacketBridgeConfig
 
 
 def setup_logging(level: str) -> None:
@@ -147,6 +147,56 @@ def setup_logging(level: str) -> None:
     help="Comma-separated list of MeshCore event types to subscribe to",
 )
 @click.option(
+    "--packet-bridge-enabled/--no-packet-bridge",
+    default=None,
+    help="Enable raw packet bridging",
+)
+@click.option("--packet-bridge-link-id", default=None, help="Packet bridge link ID")
+@click.option(
+    "--packet-bridge-endpoint-id", default=None, help="Local packet bridge endpoint ID"
+)
+@click.option(
+    "--packet-bridge-peer-ids",
+    default=None,
+    help="Comma-separated packet bridge peer endpoint IDs",
+)
+@click.option(
+    "--packet-bridge-envelope-ttl-ms",
+    type=int,
+    default=None,
+    help="Bridge envelope TTL",
+)
+@click.option(
+    "--packet-bridge-dedup-ttl-ms", type=int, default=None, help="Bridge dedup TTL"
+)
+@click.option(
+    "--packet-bridge-dedup-db", default=None, help="Bridge SQLite database path"
+)
+@click.option(
+    "--packet-bridge-max-queue", type=int, default=None, help="Bridge queue capacity"
+)
+@click.option(
+    "--packet-bridge-max-hops", type=int, default=None, help="Maximum bridge hops"
+)
+@click.option(
+    "--packet-bridge-transmit-priority",
+    type=int,
+    default=None,
+    help="Companion raw packet transmit priority",
+)
+@click.option(
+    "--packet-bridge-tx-delay-min-ms",
+    type=int,
+    default=None,
+    help="Minimum MQTT-to-radio delay",
+)
+@click.option(
+    "--packet-bridge-tx-delay-max-ms",
+    type=int,
+    default=None,
+    help="Maximum MQTT-to-radio delay",
+)
+@click.option(
     "--meshcore-message-retry-count",
     type=click.IntRange(0, 10),
     default=3,
@@ -207,6 +257,18 @@ def main(
     meshcore_timeout: int,
     meshcore_auto_fetch_restart_delay: int,
     meshcore_events: Optional[str],
+    packet_bridge_enabled: Optional[bool],
+    packet_bridge_link_id: Optional[str],
+    packet_bridge_endpoint_id: Optional[str],
+    packet_bridge_peer_ids: Optional[str],
+    packet_bridge_envelope_ttl_ms: Optional[int],
+    packet_bridge_dedup_ttl_ms: Optional[int],
+    packet_bridge_dedup_db: Optional[str],
+    packet_bridge_max_queue: Optional[int],
+    packet_bridge_max_hops: Optional[int],
+    packet_bridge_transmit_priority: Optional[int],
+    packet_bridge_tx_delay_min_ms: Optional[int],
+    packet_bridge_tx_delay_max_ms: Optional[int],
     meshcore_message_retry_count: int,
     meshcore_message_retry_delay: float,
     meshcore_reset_path_on_failure: bool,
@@ -288,6 +350,34 @@ def main(
                 log_level=log_level,
             )
 
+            if packet_bridge_enabled is not None:
+                config.packet_bridge = PacketBridgeConfig(
+                    enabled=packet_bridge_enabled,
+                    link_id=packet_bridge_link_id or "",
+                    endpoint_id=packet_bridge_endpoint_id or "",
+                    peer_ids=(
+                        packet_bridge_peer_ids.split(",")
+                        if packet_bridge_peer_ids
+                        else []
+                    ),
+                    envelope_ttl_ms=packet_bridge_envelope_ttl_ms or 30_000,
+                    dedup_ttl_ms=packet_bridge_dedup_ttl_ms or 120_000,
+                    dedup_db=packet_bridge_dedup_db or "packet-bridge.sqlite3",
+                    max_queue=packet_bridge_max_queue or 128,
+                    max_bridge_hops=packet_bridge_max_hops or 2,
+                    transmit_priority=packet_bridge_transmit_priority or 0,
+                    tx_delay_min_ms=(
+                        packet_bridge_tx_delay_min_ms
+                        if packet_bridge_tx_delay_min_ms is not None
+                        else 3_000
+                    ),
+                    tx_delay_max_ms=(
+                        packet_bridge_tx_delay_max_ms
+                        if packet_bridge_tx_delay_max_ms is not None
+                        else 5_000
+                    ),
+                )
+
         # Override config with any provided command line arguments
         if mqtt_broker:
             config.mqtt.broker = mqtt_broker
@@ -311,6 +401,85 @@ def main(
             config.meshcore.auto_fetch_restart_delay = meshcore_auto_fetch_restart_delay
         if meshcore_events:
             config.meshcore.events = Config.parse_events_string(meshcore_events)
+
+        bridge_options_provided = any(
+            option is not None
+            for option in (
+                packet_bridge_enabled,
+                packet_bridge_link_id,
+                packet_bridge_endpoint_id,
+                packet_bridge_peer_ids,
+                packet_bridge_envelope_ttl_ms,
+                packet_bridge_dedup_ttl_ms,
+                packet_bridge_dedup_db,
+                packet_bridge_max_queue,
+                packet_bridge_max_hops,
+                packet_bridge_transmit_priority,
+                packet_bridge_tx_delay_min_ms,
+                packet_bridge_tx_delay_max_ms,
+            )
+        )
+        if bridge_options_provided:
+            current = config.packet_bridge
+            config.packet_bridge = PacketBridgeConfig(
+                enabled=(
+                    packet_bridge_enabled
+                    if packet_bridge_enabled is not None
+                    else (current.enabled if current else True)
+                ),
+                link_id=packet_bridge_link_id or (current.link_id if current else ""),
+                endpoint_id=packet_bridge_endpoint_id
+                or (current.endpoint_id if current else ""),
+                peer_ids=(
+                    packet_bridge_peer_ids.split(",")
+                    if packet_bridge_peer_ids
+                    else (current.peer_ids if current else [])
+                ),
+                envelope_ttl_ms=(
+                    packet_bridge_envelope_ttl_ms
+                    if packet_bridge_envelope_ttl_ms is not None
+                    else (current.envelope_ttl_ms if current else 30_000)
+                ),
+                dedup_ttl_ms=(
+                    packet_bridge_dedup_ttl_ms
+                    if packet_bridge_dedup_ttl_ms is not None
+                    else (current.dedup_ttl_ms if current else 120_000)
+                ),
+                dedup_db=packet_bridge_dedup_db
+                or (current.dedup_db if current else "packet-bridge.sqlite3"),
+                max_queue=(
+                    packet_bridge_max_queue
+                    if packet_bridge_max_queue is not None
+                    else (current.max_queue if current else 128)
+                ),
+                max_bridge_hops=(
+                    packet_bridge_max_hops
+                    if packet_bridge_max_hops is not None
+                    else (current.max_bridge_hops if current else 2)
+                ),
+                transmit_priority=(
+                    packet_bridge_transmit_priority
+                    if packet_bridge_transmit_priority is not None
+                    else (current.transmit_priority if current else 0)
+                ),
+                tx_delay_min_ms=(
+                    packet_bridge_tx_delay_min_ms
+                    if packet_bridge_tx_delay_min_ms is not None
+                    else (current.tx_delay_min_ms if current else 3_000)
+                ),
+                tx_delay_max_ms=(
+                    packet_bridge_tx_delay_max_ms
+                    if packet_bridge_tx_delay_max_ms is not None
+                    else (current.tx_delay_max_ms if current else 5_000)
+                ),
+            )
+        if config.packet_bridge and config.packet_bridge.enabled:
+            if config.meshcore.connection_type != ConnectionType.SERIAL:
+                raise ValueError(
+                    "packet bridging requires meshcore connection_type: serial"
+                )
+            if "RX_LOG_DATA" not in config.meshcore.events:
+                config.meshcore.events.append("RX_LOG_DATA")
 
         # Set up logging
         setup_logging(config.log_level)

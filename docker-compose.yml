@@ -29,9 +29,24 @@ services:
       # Configurable events (comma-separated)
       - MESHCORE_EVENTS=CONTACT_MSG_RECV,CHANNEL_MSG_RECV,CONNECTED,DISCONNECTED,LOGIN_SUCCESS,DEVICE_INFO,BATTERY,ADVERTISEMENT
 
+      # Optional raw packet bridge. Set reciprocal endpoint and peer IDs per instance.
+      - PACKET_BRIDGE_ENABLED=false
+      - PACKET_BRIDGE_LINK_ID=backhaul-1
+      - PACKET_BRIDGE_ENDPOINT_ID=a
+      - PACKET_BRIDGE_PEER_IDS=b
+      - PACKET_BRIDGE_DEDUP_DB=/data/packet-bridge-a.sqlite3
+      - PACKET_BRIDGE_MAX_QUEUE=128
+      - PACKET_BRIDGE_MAX_HOPS=2
+      - PACKET_BRIDGE_TRANSMIT_PRIORITY=0
+      - PACKET_BRIDGE_TX_DELAY_MIN_MS=3000
+      - PACKET_BRIDGE_TX_DELAY_MAX_MS=5000
+
     # Device access for serial communication
     devices:
       - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+    volumes:
+      - bridge-data:/data
 
     # Network configuration
     networks:
@@ -77,6 +92,7 @@ services:
       /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf'
 
 volumes:
+  bridge-data:
   mqtt-config:
   mqtt-data:
   mqtt-logs:

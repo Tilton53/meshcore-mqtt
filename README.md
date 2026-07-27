@@ -19,6 +19,7 @@ A robust bridge service that connects MeshCore devices to MQTT brokers, enabling
 - **MQTT Integration**: Full MQTT client with authentication, QoS, retention, and auto-reconnection
 - **Configurable Event Monitoring**: Subscribe to specific MeshCore event types for optimal performance
 - **Message Rate Limiting**: Configurable rate limiting to prevent network flooding and ensure reliable message delivery
+- **Raw Packet Bridging**: Optional bidirectional, byte-preserving serial companion bridge over MQTT
 - **Health Monitoring**: Built-in health checks and automatic recovery for both workers
 - **Async Architecture**: Built with Python asyncio for high performance and concurrent operations
 - **Type Safety**: Full type annotations with mypy support
@@ -75,6 +76,23 @@ The bridge supports multiple configuration methods with the following precedence
 
 #### General Settings
 - `log_level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+
+#### Raw Packet Bridge Settings
+
+`packet_bridge` is optional. When absent or disabled, no bridge topics or raw packet
+subscriptions are created. Enabling it requires `meshcore.connection_type: serial`
+and companion firmware supporting command `65` (`CMD_SEND_RAW_PACKET`).
+
+- `enabled`: Enable packet bridge
+- `link_id`: Shared MQTT bridge link identifier
+- `endpoint_id`: Local endpoint identifier
+- `peer_ids`: Exact reciprocal peer endpoint IDs
+- `envelope_ttl_ms`, `dedup_ttl_ms`: Envelope and durable dedup lifetimes
+- `dedup_db`: SQLite WAL database path; use unique path per process
+- `max_queue`: Maximum pending bridge messages and delayed injections
+- `max_bridge_hops`: Maximum transport trace length
+- `transmit_priority`: Companion command priority byte (`0`-`255`)
+- `tx_delay_min_ms`, `tx_delay_max_ms`: Inclusive MQTT-to-radio jitter window
 
 ### Configuration Examples
 
@@ -157,6 +175,11 @@ export MESHCORE_AUTO_FETCH_RESTART_DELAY=10
 export MESHCORE_MESSAGE_INITIAL_DELAY=15.0
 export MESHCORE_MESSAGE_SEND_DELAY=15.0
 export MESHCORE_EVENTS="CONNECTED,DISCONNECTED,BATTERY,DEVICE_INFO"
+export PACKET_BRIDGE_ENABLED=true
+export PACKET_BRIDGE_LINK_ID=backhaul-1
+export PACKET_BRIDGE_ENDPOINT_ID=a
+export PACKET_BRIDGE_PEER_IDS=b
+export PACKET_BRIDGE_DEDUP_DB=packet-bridge-a.sqlite3
 export LOG_LEVEL=INFO
 ```
 
@@ -206,6 +229,23 @@ python -m meshcore_mqtt.main \
   --meshcore-address /dev/ttyUSB0 \
   --meshcore-baudrate 9600
 ```
+
+#### Two-radio raw packet bridge
+
+Run two independent instances against one broker. Each instance needs one USB
+companion radio, unique `endpoint_id`, reciprocal `peer_ids`, and unique persistent
+SQLite path. Example endpoint `a` publishes to:
+
+```text
+meshcore/bridge/v1/backhaul-1/a/tx
+```
+
+Endpoint `b` subscribes to that exact topic and publishes to its own `b/tx` topic.
+Local `RX_LOG_DATA` packet bytes become CBOR envelopes. Remote envelopes are validated,
+durably deduplicated, delayed by the configured jitter window, then sent unchanged as
+command `65` bytes: `0x41 | priority | serialized_packet`. Bridge messages always use
+QoS `1` and `retain=False`, regardless of general MQTT settings. Native RF arrival
+during delay cancels MQTT injection.
 
 #### BLE Connection
 ```bash

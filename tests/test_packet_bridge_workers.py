@@ -1,0 +1,83 @@
+"""Worker-level packet bridge behavior tests."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from meshcore.events import Event, EventType
+
+from meshcore_mqtt.config import (
+    Config,
+    ConnectionType,
+    MeshCoreConfig,
+    MQTTConfig,
+    PacketBridgeConfig,
+)
+from meshcore_mqtt.meshcore_worker import MeshCoreWorker
+from meshcore_mqtt.message_queue import Message, MessageType, reset_message_bus
+from meshcore_mqtt.packet_bridge import BridgeEnvelope
+
+
+def bridge_config(tmp_path, *, min_delay=0, max_delay=0) -> Config:
+    return Config(
+        mqtt=MQTTConfig(broker="localhost", retain=True, qos=0),
+        meshcore=MeshCoreConfig(
+            connection_type=ConnectionType.SERIAL, address="/dev/fake"
+        ),
+        packet_bridge=PacketBridgeConfig(
+            enabled=True,
+            link_id="link",
+            endpoint_id="a",
+            peer_ids=["b"],
+            dedup_db=str(tmp_path / "bridge.sqlite3"),
+            tx_delay_min_ms=min_delay,
+            tx_delay_max_ms=max_delay,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_raw_packet_command_uses_exact_wire_bytes(tmp_path) -> None:
+    reset_message_bus()
+    worker = MeshCoreWorker(bridge_config(tmp_path))
+    sender = AsyncMock()
+    worker.meshcore = SimpleNamespace(
+        commands=SimpleNamespace(send=sender),
+    )
+
+    await worker._send_raw_packet_command(b"serialized", priority=9)
+
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == b"\x41\x09serialized"
+    assert sender.await_args.args[1] == [EventType.OK, EventType.ERROR]
+    await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_remote_packet_schedules_then_matching_rf_cancels(tmp_path) -> None:
+    reset_message_bus()
+    worker = MeshCoreWorker(bridge_config(tmp_path, min_delay=3000, max_delay=5000))
+    envelope = BridgeEnvelope.create("b", b"serialized", 30_000, ["b"])
+
+    await worker._handle_mqtt_raw_packet(
+        Message.create(
+            MessageType.MQTT_RAW_PACKET,
+            "mqtt",
+            "meshcore",
+            {"envelope": envelope},
+        )
+    )
+    assert len(worker._pending_injections) == 1
+    assert (
+        3.0
+        <= next(iter(worker._pending_injections.values())).deadline
+        - __import__("time").monotonic()
+        <= 5.0
+    )
+
+    worker._handle_bridge_rx_event(
+        Event(EventType.RX_LOG_DATA, {"payload": "73657269616c697a6564"})
+    )
+    assert not worker._pending_injections
+    assert worker._bridge_stats["rf_cancelled"] == 1
+    await worker.stop()

@@ -245,6 +245,7 @@ class BridgeCoordinator:
                     },
                 },
                 "message_bus": stats,
+                "packet_bridge": self._bridge_stats(),
             }
 
         except Exception as e:
@@ -272,12 +273,37 @@ class BridgeCoordinator:
                         "port": getattr(self.config.meshcore, "port", None),
                     },
                     "events": self.config.meshcore.events,
+                    "packet_bridge": self._bridge_stats(),
                 },
             }
 
         except Exception as e:
             self.logger.error(f"Error getting stats: {e}")
             return {"error": str(e)}
+
+    def _bridge_stats(self) -> dict[str, Any]:
+        """Return packet-bridge health data without packet contents."""
+        bridge_config = self.config.packet_bridge
+        if not bridge_config or not bridge_config.enabled:
+            return {"enabled": False}
+        meshcore_stats = (
+            self.meshcore_worker._bridge_stats if self.meshcore_worker else {}
+        )
+        mqtt_stats = self.mqtt_worker._bridge_stats if self.mqtt_worker else {}
+        pending = (
+            len(self.meshcore_worker._pending_injections) if self.meshcore_worker else 0
+        )
+        return {
+            "enabled": True,
+            "link_id": bridge_config.link_id,
+            "endpoint_id": bridge_config.endpoint_id,
+            "peer_ids": list(bridge_config.peer_ids),
+            "max_queue": bridge_config.max_queue,
+            "dedup_ttl_ms": bridge_config.dedup_ttl_ms,
+            "pending_injection_depth": pending,
+            "meshcore": dict(meshcore_stats),
+            "mqtt": dict(mqtt_stats),
+        }
 
     # Compatibility methods for existing tests
     @property

@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import random
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -31,6 +33,22 @@ from .message_queue import (
     MessageType,
     get_message_bus,
 )
+from .packet_bridge import (
+    BridgeEnvelope,
+    BridgeEnvelopeError,
+    build_send_raw_packet_command,
+    packet_sha256,
+)
+from .packet_dedup import PacketDedupStore
+
+
+@dataclass
+class PendingPacketInjection:
+    """Delayed MQTT packet waiting for monotonic transmit deadline."""
+
+    deadline: float
+    envelope: BridgeEnvelope
+    packet_hash: str
 
 
 class MeshCoreWorker:
@@ -47,7 +65,12 @@ class MeshCoreWorker:
         # Message bus
         self.message_bus: MessageBus = get_message_bus()
         self.inbox: MessageQueue = self.message_bus.register_component(
-            self.component_name, queue_size=1000
+            self.component_name,
+            queue_size=(
+                self.config.packet_bridge.max_queue
+                if self.config.packet_bridge and self.config.packet_bridge.enabled
+                else 1000
+            ),
         )
 
         # MeshCore components
@@ -88,6 +111,26 @@ class MeshCoreWorker:
         self._rate_limit_task: Optional[asyncio.Task[None]] = None
         self._send_lock = asyncio.Lock()  # Global send lock for all message operations
 
+        # Optional raw packet bridge state
+        bridge_config = self.config.packet_bridge
+        self._bridge_enabled = bool(bridge_config and bridge_config.enabled)
+        self._bridge_store: Optional[PacketDedupStore] = None
+        if self._bridge_enabled and bridge_config:
+            self._bridge_store = PacketDedupStore(
+                bridge_config.dedup_db, bridge_config.dedup_ttl_ms
+            )
+        self._pending_injections: Dict[str, PendingPacketInjection] = {}
+        self._pending_wakeup = asyncio.Event()
+        self._bridge_stats: Dict[str, int] = {
+            "scheduled": 0,
+            "rf_cancelled": 0,
+            "expired": 0,
+            "injected": 0,
+            "failed": 0,
+            "queue_dropped": 0,
+            "invalid_local": 0,
+        }
+
     async def start(self) -> None:
         """Start the MeshCore worker."""
         if self._running:
@@ -121,6 +164,13 @@ class MeshCoreWorker:
                     self._message_rate_limiter(), name="meshcore_rate_limiter"
                 ),
             ]
+            if self._bridge_enabled:
+                tasks.append(
+                    asyncio.create_task(
+                        self._packet_injection_scheduler(),
+                        name="meshcore_packet_bridge_scheduler",
+                    )
+                )
             self._tasks.extend(tasks)
 
             # Update status to running
@@ -145,6 +195,9 @@ class MeshCoreWorker:
     async def stop(self) -> None:
         """Stop the MeshCore worker."""
         if not self._running:
+            if self._bridge_store:
+                self._bridge_store.close()
+                self._bridge_store = None
             return
 
         self.logger.info("Stopping MeshCore worker")
@@ -171,6 +224,10 @@ class MeshCoreWorker:
                 await self.meshcore.disconnect()
             except Exception as e:
                 self.logger.error(f"Error stopping MeshCore connection: {e}")
+
+        if self._bridge_store:
+            self._bridge_store.close()
+            self._bridge_store = None
 
         self.message_bus.update_component_status(
             self.component_name, ComponentStatus.STOPPED
@@ -277,6 +334,20 @@ class MeshCoreWorker:
             except AttributeError:
                 self.logger.warning("ACK event type not available")
 
+            # RX_LOG_DATA is required independently of the user event list when
+            # packet bridging is enabled.
+            if self._bridge_enabled:
+                try:
+                    rx_log_event = getattr(EventType, "RX_LOG_DATA")
+                    if rx_log_event not in configured_events:
+                        self.meshcore.subscribe(rx_log_event, self._on_meshcore_event)
+                    self.logger.info("Subscribed to RX_LOG_DATA for packet bridging")
+                except AttributeError:
+                    raise RuntimeError(
+                        "MeshCore SDK does not expose RX_LOG_DATA required "
+                        "for packet bridging"
+                    )
+
     async def _message_processor(self) -> None:
         """Process messages from the inbox."""
         self.logger.info("Starting MeshCore message processor")
@@ -301,6 +372,8 @@ class MeshCoreWorker:
         try:
             if message.message_type == MessageType.MQTT_COMMAND:
                 await self._handle_mqtt_command(message)
+            elif message.message_type == MessageType.MQTT_RAW_PACKET:
+                await self._handle_mqtt_raw_packet(message)
             elif message.message_type == MessageType.HEALTH_CHECK:
                 await self._handle_health_check(message)
             elif message.message_type == MessageType.SHUTDOWN:
@@ -313,6 +386,137 @@ class MeshCoreWorker:
 
         except Exception as e:
             self.logger.error(f"Error handling message {message.id}: {e}")
+
+    async def _handle_mqtt_raw_packet(self, message: Message) -> None:
+        """Schedule validated peer envelope for delayed radio injection."""
+        if not self._bridge_enabled or not self.config.packet_bridge:
+            return
+        payload = message.payload
+        envelope = payload.get("envelope") if isinstance(payload, dict) else payload
+        if not isinstance(envelope, BridgeEnvelope):
+            self.logger.warning("Dropping raw packet message with invalid envelope")
+            self._bridge_stats["invalid_local"] += 1
+            return
+        bridge_config = self.config.packet_bridge
+        try:
+            envelope.validated(
+                now_ms=int(time.time() * 1000),
+                max_bridge_hops=bridge_config.max_bridge_hops,
+                local_endpoint=bridge_config.endpoint_id,
+            )
+        except BridgeEnvelopeError as exc:
+            self.logger.info("Dropping raw packet envelope: %s", exc)
+            self._bridge_stats["invalid_local"] += 1
+            return
+
+        packet_hash = packet_sha256(envelope.packet)
+        if packet_hash in self._pending_injections:
+            self.logger.debug("Dropping duplicate pending raw packet")
+            return
+        if len(self._pending_injections) >= bridge_config.max_queue:
+            self._bridge_stats["queue_dropped"] += 1
+            self.logger.warning("Dropping raw packet: pending injection queue full")
+            return
+
+        delay_ms = random.uniform(
+            bridge_config.tx_delay_min_ms, bridge_config.tx_delay_max_ms
+        )
+        self._pending_injections[packet_hash] = PendingPacketInjection(
+            deadline=time.monotonic() + delay_ms / 1000.0,
+            envelope=envelope,
+            packet_hash=packet_hash,
+        )
+        self._bridge_stats["scheduled"] += 1
+        self._pending_wakeup.set()
+
+    async def _packet_injection_scheduler(self) -> None:
+        """Inject delayed packets in monotonic deadline order."""
+        while self._running:
+            if not self._pending_injections:
+                self._pending_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._pending_wakeup.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                continue
+
+            next_item = min(
+                self._pending_injections.values(), key=lambda item: item.deadline
+            )
+            wait_seconds = max(0.0, next_item.deadline - time.monotonic())
+            self._pending_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._pending_wakeup.wait(), timeout=wait_seconds
+                )
+                continue
+            except asyncio.TimeoutError:
+                pass
+
+            due = [
+                item
+                for item in self._pending_injections.values()
+                if item.deadline <= time.monotonic()
+            ]
+            for item in sorted(due, key=lambda value: value.deadline):
+                self._pending_injections.pop(item.packet_hash, None)
+                await self._inject_pending_packet(item)
+
+    async def _inject_pending_packet(self, item: PendingPacketInjection) -> None:
+        """Revalidate and transmit one due packet."""
+        bridge_config = self.config.packet_bridge
+        if not bridge_config:
+            return
+        try:
+            item.envelope.validated(
+                now_ms=int(time.time() * 1000),
+                max_bridge_hops=bridge_config.max_bridge_hops,
+                local_endpoint=bridge_config.endpoint_id,
+            )
+        except BridgeEnvelopeError:
+            self._bridge_stats["expired"] += 1
+            return
+        if not self._connected or not self.meshcore:
+            self._bridge_stats["failed"] += 1
+            self.logger.warning("Dropping due raw packet: companion disconnected")
+            return
+        if not self._bridge_store or not self._bridge_store.remember_packet(
+            item.envelope.packet
+        ):
+            self.logger.debug("Dropping raw packet already seen over RF")
+            return
+
+        try:
+            result = await self._send_raw_packet_command(
+                item.envelope.packet, bridge_config.transmit_priority
+            )
+            if getattr(result, "type", None) == EventType.ERROR:
+                reason = getattr(result, "payload", {})
+                if isinstance(reason, dict) and reason.get("error_code") == 1:
+                    self.logger.error(
+                        "Companion firmware does not support command 65 "
+                        "(CMD_SEND_RAW_PACKET)"
+                    )
+                else:
+                    self.logger.error("Command 65 rejected raw packet: %s", reason)
+                self._bridge_stats["failed"] += 1
+                return
+            self._bridge_stats["injected"] += 1
+        except Exception as exc:
+            self._bridge_stats["failed"] += 1
+            self.logger.error("Command 65 raw packet injection failed: %s", exc)
+
+    async def _send_raw_packet_command(self, packet: bytes, priority: int) -> Any:
+        """Send command 65 through one serialized low-level SDK call."""
+        if not self.meshcore:
+            raise RuntimeError("MeshCore not initialized")
+        command = build_send_raw_packet_command(packet, priority)
+        async with self._send_lock:
+            commands = self.meshcore.commands
+            upstream_wrapper = getattr(commands, "send_raw_packet", None)
+            if upstream_wrapper is not None:
+                return await upstream_wrapper(packet, priority=priority)
+            return await commands.send(command, [EventType.OK, EventType.ERROR])
 
     async def _handle_mqtt_command(self, message: Message) -> None:
         """Handle MQTT command forwarded from MQTT worker."""
@@ -996,6 +1200,10 @@ class MeshCoreWorker:
                 # Don't forward NO_MORE_MSGS to MQTT as it's internal
                 return
 
+            if event_name == "RX_LOG_DATA" and self._bridge_enabled:
+                self._handle_bridge_rx_event(event_data)
+                return
+
             # Add extra logging for connection events to help debug
             if event_name in ["CONNECTED", "DISCONNECTED"]:
                 self.logger.info(f"MeshCore {event_name} event received: {event_data}")
@@ -1022,6 +1230,61 @@ class MeshCoreWorker:
 
         except Exception as e:
             self.logger.error(f"Error processing MeshCore event: {e}")
+
+    def _handle_bridge_rx_event(self, event_data: Any) -> None:
+        """Extract local RF bytes and enqueue them for immediate MQTT publish."""
+        bridge_config = self.config.packet_bridge
+        if not bridge_config or not self._bridge_store:
+            return
+        payload = getattr(event_data, "payload", None)
+        if payload is None and isinstance(event_data, dict):
+            payload = event_data.get("payload")
+        if isinstance(payload, dict):
+            payload = payload.get("payload")
+        packet: Optional[bytes] = None
+        try:
+            if isinstance(payload, bytes):
+                packet = payload
+            elif isinstance(payload, str):
+                packet = bytes.fromhex(payload)
+            else:
+                raise ValueError("payload is not hexadecimal text or bytes")
+            if not packet:
+                raise ValueError("payload is empty")
+            packet_hash = packet_sha256(packet)
+
+            # Native RF arrival wins over a pending MQTT transmission.
+            pending = self._pending_injections.pop(packet_hash, None)
+            if pending is not None:
+                self._bridge_stats["rf_cancelled"] += 1
+                self._pending_wakeup.set()
+
+            if not self._bridge_store.remember_packet(packet):
+                self.logger.debug("Suppressing previously bridged RF packet")
+                return
+
+            envelope = BridgeEnvelope.create(
+                src=bridge_config.endpoint_id,
+                packet=packet,
+                ttl=bridge_config.envelope_ttl_ms,
+                trace=(bridge_config.endpoint_id,),
+            )
+            message = Message.create(
+                message_type=MessageType.MESHCORE_RAW_PACKET,
+                source=self.component_name,
+                target="mqtt",
+                payload={"packet": packet, "envelope": envelope},
+            )
+            asyncio.create_task(self._queue_local_raw_packet(message))
+        except (ValueError, BridgeEnvelopeError) as exc:
+            self._bridge_stats["invalid_local"] += 1
+            self.logger.warning("Dropping malformed RX_LOG_DATA packet: %s", exc)
+
+    async def _queue_local_raw_packet(self, message: Message) -> None:
+        """Queue local packet for publication and count pressure drops."""
+        if not await self.message_bus.send_message(message, timeout=0.1):
+            self._bridge_stats["queue_dropped"] += 1
+            self.logger.warning("Dropping local raw packet: MQTT queue full")
 
     async def _send_status_update(self, status: ComponentStatus, details: str) -> None:
         """Send status update to other components."""

@@ -29,5 +29,19 @@
       "ADVERTISEMENT"
     ]
   },
+  "packet_bridge": {
+    "enabled": false,
+    "link_id": "backhaul-1",
+    "endpoint_id": "a",
+    "peer_ids": ["b"],
+    "envelope_ttl_ms": 30000,
+    "dedup_ttl_ms": 120000,
+    "dedup_db": "packet-bridge-a.sqlite3",
+    "max_queue": 128,
+    "max_bridge_hops": 2,
+    "transmit_priority": 0,
+    "tx_delay_min_ms": 3000,
+    "tx_delay_max_ms": 5000
+  },
   "log_level": "INFO"
 }

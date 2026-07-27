@@ -18,6 +18,13 @@ from .message_queue import (
     MessageType,
     get_message_bus,
 )
+from .packet_bridge import (
+    BridgeEnvelope,
+    BridgeEnvelopeError,
+    bridge_topic,
+    validate_topic_source,
+)
+from .packet_dedup import PacketDedupStore
 
 
 class MQTTWorker:
@@ -34,7 +41,12 @@ class MQTTWorker:
         # Message bus
         self.message_bus: MessageBus = get_message_bus()
         self.inbox: MessageQueue = self.message_bus.register_component(
-            self.component_name, queue_size=1000
+            self.component_name,
+            queue_size=(
+                self.config.packet_bridge.max_queue
+                if self.config.packet_bridge and self.config.packet_bridge.enabled
+                else 1000
+            ),
         )
 
         # MQTT client
@@ -52,6 +64,28 @@ class MQTTWorker:
         self._shutdown_event = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        bridge_config = self.config.packet_bridge
+        self._bridge_enabled = bool(bridge_config and bridge_config.enabled)
+        self._bridge_topics: Dict[str, str] = {}
+        self._bridge_store: Optional[PacketDedupStore] = None
+        self._bridge_stats: Dict[str, int] = {
+            "published": 0,
+            "received": 0,
+            "invalid": 0,
+            "duplicate_envelopes": 0,
+            "publish_dropped": 0,
+        }
+        if self._bridge_enabled and bridge_config:
+            self._bridge_store = PacketDedupStore(
+                bridge_config.dedup_db, bridge_config.dedup_ttl_ms
+            )
+            self._bridge_topics = {
+                bridge_topic(
+                    config.mqtt.topic_prefix, bridge_config.link_id, peer
+                ): peer
+                for peer in bridge_config.peer_ids
+            }
 
     async def start(self) -> None:
         """Start the MQTT worker."""
@@ -103,6 +137,9 @@ class MQTTWorker:
     async def stop(self) -> None:
         """Stop the MQTT worker."""
         if not self._running:
+            if self._bridge_store:
+                self._bridge_store.close()
+                self._bridge_store = None
             return
 
         self.logger.info("Stopping MQTT worker")
@@ -133,6 +170,10 @@ class MQTTWorker:
                     self.client.disconnect()
             except Exception as e:
                 self.logger.error(f"Error stopping MQTT client: {e}")
+
+        if self._bridge_store:
+            self._bridge_store.close()
+            self._bridge_store = None
 
         self.message_bus.update_component_status(
             self.component_name, ComponentStatus.STOPPED
@@ -165,7 +206,13 @@ class MQTTWorker:
     def _create_client(self) -> mqtt.Client:
         """Create and configure a new MQTT client."""
         # Generate a unique client ID
-        client_id = f"meshcore-mqtt-{uuid.uuid4().hex[:8]}"
+        if self._bridge_enabled and self.config.packet_bridge:
+            client_id = (
+                f"meshcore-mqtt-{self.config.packet_bridge.link_id}-"
+                f"{self.config.packet_bridge.endpoint_id}"
+            )
+        else:
+            client_id = f"meshcore-mqtt-{uuid.uuid4().hex[:8]}"
         self.logger.debug(f"Using MQTT client ID: {client_id}")
 
         client = mqtt.Client(
@@ -284,6 +331,8 @@ class MQTTWorker:
         try:
             if message.message_type == MessageType.MESHCORE_EVENT:
                 await self._handle_meshcore_event(message)
+            elif message.message_type == MessageType.MESHCORE_RAW_PACKET:
+                await self._handle_meshcore_raw_packet(message)
             elif message.message_type == MessageType.MESHCORE_STATUS:
                 await self._handle_meshcore_status(message)
             elif message.message_type == MessageType.HEALTH_CHECK:
@@ -298,6 +347,31 @@ class MQTTWorker:
 
         except Exception as e:
             self.logger.error(f"Error handling message {message.id}: {e}")
+
+    async def _handle_meshcore_raw_packet(self, message: Message) -> None:
+        """Publish local raw packet envelope immediately with bridge QoS policy."""
+        if not self._bridge_enabled or not self.config.packet_bridge:
+            return
+        if not self._connected:
+            self._bridge_stats["publish_dropped"] += 1
+            self.logger.warning("Dropping local raw packet: MQTT disconnected")
+            return
+        payload = message.payload
+        envelope = payload.get("envelope") if isinstance(payload, dict) else None
+        if not isinstance(envelope, BridgeEnvelope):
+            self._bridge_stats["publish_dropped"] += 1
+            self.logger.warning("Dropping local raw packet with invalid envelope")
+            return
+        bridge_config = self.config.packet_bridge
+        topic = bridge_topic(
+            self.config.mqtt.topic_prefix,
+            bridge_config.link_id,
+            bridge_config.endpoint_id,
+        )
+        if await self._safe_mqtt_publish(topic, envelope.encode(), retain=False, qos=1):
+            self._bridge_stats["published"] += 1
+        else:
+            self._bridge_stats["publish_dropped"] += 1
 
     async def _handle_meshcore_event(self, message: Message) -> None:
         """Handle MeshCore event and publish to MQTT."""
@@ -605,7 +679,11 @@ class MQTTWorker:
         self.logger.info("Fresh MQTT client connected")
 
     async def _safe_mqtt_publish(
-        self, topic: str, payload: str, retain: bool = False
+        self,
+        topic: str,
+        payload: Any,
+        retain: Optional[bool] = None,
+        qos: Optional[int] = None,
     ) -> bool:
         """Safely publish to MQTT broker."""
         if not self.client:
@@ -621,19 +699,22 @@ class MQTTWorker:
                     asyncio.create_task(self._recover_connection())
                 return False
 
-            qos = self.config.mqtt.qos
-            retain = retain or self.config.mqtt.retain
+            effective_qos = self.config.mqtt.qos if qos is None else qos
+            effective_retain = self.config.mqtt.retain if retain is None else retain
 
             self.logger.debug(
-                f"Publishing to MQTT: topic={topic}, qos={qos}, retain={retain}, "
+                f"Publishing to MQTT: topic={topic}, qos={effective_qos}, "
+                f"retain={effective_retain}, "
                 f"payload_length={len(payload)}"
             )
 
-            result = self.client.publish(topic, payload, qos=qos, retain=retain)
+            result = self.client.publish(
+                topic, payload, qos=effective_qos, retain=effective_retain
+            )
 
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 self._last_activity = time.time()
-                if qos > 0:
+                if effective_qos > 0:
                     result.wait_for_publish(timeout=5.0)
                 return True
             elif result.rc == mqtt.MQTT_ERR_NO_CONN:
@@ -682,6 +763,9 @@ class MQTTWorker:
             command_topic = f"{self.config.mqtt.topic_prefix}/command/+"
             client.subscribe(command_topic, self.config.mqtt.qos)
             self.logger.info(f"Subscribed to MQTT topic: {command_topic}")
+            for topic in self._bridge_topics:
+                client.subscribe(topic, 1)
+                self.logger.info(f"Subscribed to bridge topic: {topic}")
         else:
             self.logger.error(f"Failed to connect to MQTT broker: {rc}")
             self._connected = False
@@ -721,7 +805,14 @@ class MQTTWorker:
         """Handle incoming MQTT messages."""
         try:
             topic_parts = message.topic.split("/")
-            if len(topic_parts) >= 3 and topic_parts[1] == "command":
+            if message.topic in self._bridge_topics:
+                self._handle_bridge_message(message)
+                return
+            if (
+                len(topic_parts) >= 3
+                and topic_parts[0] == self.config.mqtt.topic_prefix
+                and topic_parts[1] == "command"
+            ):
                 command_type = topic_parts[2]
                 payload = message.payload.decode("utf-8")
 
@@ -732,6 +823,50 @@ class MQTTWorker:
 
         except Exception as e:
             self.logger.error(f"Error processing MQTT message: {e}")
+
+    def _handle_bridge_message(self, message: mqtt.MQTTMessage) -> None:
+        """Validate peer envelope in Paho callback thread."""
+        if not self._bridge_enabled or not self.config.packet_bridge:
+            return
+        self._bridge_stats["received"] += 1
+        peer_id = self._bridge_topics.get(message.topic)
+        if peer_id is None or not self._bridge_store:
+            self._bridge_stats["invalid"] += 1
+            return
+        bridge_config = self.config.packet_bridge
+        try:
+            envelope = BridgeEnvelope.decode(
+                bytes(message.payload),
+                now_ms=int(time.time() * 1000),
+                max_bridge_hops=bridge_config.max_bridge_hops,
+                local_endpoint=bridge_config.endpoint_id,
+            )
+            validate_topic_source(
+                message.topic,
+                self.config.mqtt.topic_prefix,
+                bridge_config.link_id,
+                envelope.src,
+            )
+            if envelope.src != peer_id:
+                raise BridgeEnvelopeError("envelope source is not configured peer")
+            if not self._bridge_store.remember_envelope(envelope.id):
+                self._bridge_stats["duplicate_envelopes"] += 1
+                return
+        except (BridgeEnvelopeError, ValueError, TypeError) as exc:
+            self._bridge_stats["invalid"] += 1
+            self.logger.warning("Dropping invalid bridge envelope: %s", exc)
+            return
+
+        message_to_meshcore = Message.create(
+            message_type=MessageType.MQTT_RAW_PACKET,
+            source=self.component_name,
+            target="meshcore",
+            payload={"envelope": envelope},
+        )
+        if self._event_loop and not self._event_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self.message_bus.send_message(message_to_meshcore), self._event_loop
+            )
 
     def _forward_command_to_meshcore(self, command_type: str, payload: str) -> None:
         """Forward MQTT command to MeshCore worker."""

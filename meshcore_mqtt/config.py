@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+MQTT_PATH_SEGMENT_INVALID = {"/", "+", "#"}
+PACKET_BRIDGE_MAX_PACKET_SIZE = 176
 
 
 class ConnectionType(str, Enum):
@@ -165,6 +168,7 @@ class MeshCoreConfig(BaseModel):
             "CONTACTS",
             "SELF_INFO",
             "CHANNEL_INFO",
+            "RX_LOG_DATA",
         }
 
         invalid_events = [
@@ -179,12 +183,128 @@ class MeshCoreConfig(BaseModel):
         return normalized_events
 
 
+class PacketBridgeConfig(BaseModel):
+    """Optional raw MeshCore packet bridge configuration."""
+
+    enabled: bool = Field(default=True, description="Enable packet bridging")
+    link_id: str = Field(default="", description="Shared bridge link identifier")
+    endpoint_id: str = Field(default="", description="Local bridge endpoint identifier")
+    peer_ids: List[str] = Field(default_factory=list)
+    envelope_ttl_ms: int = Field(default=30_000)
+    dedup_ttl_ms: int = Field(default=120_000)
+    dedup_db: str = Field(default="packet-bridge.sqlite3")
+    max_queue: int = Field(default=128)
+    max_bridge_hops: int = Field(default=2)
+    transmit_priority: int = Field(default=0)
+    tx_delay_min_ms: int = Field(default=3_000)
+    tx_delay_max_ms: int = Field(default=5_000)
+
+    @field_validator("link_id", "endpoint_id", mode="before")
+    @classmethod
+    def normalize_segment(cls, value: str) -> str:
+        """Normalize and validate one MQTT path segment."""
+        if not isinstance(value, str):
+            raise ValueError("bridge path segments must be strings")
+        value = value.strip()
+        if not value:
+            return value
+        if any(char in value for char in MQTT_PATH_SEGMENT_INVALID):
+            raise ValueError("bridge path segments cannot contain '/', '+' or '#'")
+        if any(char.isspace() for char in value):
+            raise ValueError("bridge path segments cannot contain whitespace")
+        return value
+
+    @field_validator("peer_ids", mode="before")
+    @classmethod
+    def normalize_peer_ids(cls, value: Any) -> List[str]:
+        """Normalize comma-separated or list peer identifiers."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",") if item.strip()]
+        if not isinstance(value, (list, tuple, set)):
+            raise ValueError("peer_ids must be a list or comma-separated string")
+        return [cls.normalize_segment(item) for item in value]
+
+    @field_validator("envelope_ttl_ms")
+    @classmethod
+    def validate_envelope_ttl(cls, value: int) -> int:
+        if not 1 <= value <= 86_400_000:
+            raise ValueError("envelope_ttl_ms must be between 1 and 86400000")
+        return value
+
+    @field_validator("dedup_ttl_ms")
+    @classmethod
+    def validate_dedup_ttl(cls, value: int) -> int:
+        if not 1 <= value <= 604_800_000:
+            raise ValueError("dedup_ttl_ms must be between 1 and 604800000")
+        return value
+
+    @field_validator("max_queue")
+    @classmethod
+    def validate_queue_size(cls, value: int) -> int:
+        if not 1 <= value <= 10_000:
+            raise ValueError("max_queue must be between 1 and 10000")
+        return value
+
+    @field_validator("max_bridge_hops")
+    @classmethod
+    def validate_hops(cls, value: int) -> int:
+        if not 1 <= value <= 32:
+            raise ValueError("max_bridge_hops must be between 1 and 32")
+        return value
+
+    @field_validator("transmit_priority")
+    @classmethod
+    def validate_priority(cls, value: int) -> int:
+        if not 0 <= value <= 255:
+            raise ValueError("transmit_priority must be between 0 and 255")
+        return value
+
+    @field_validator("tx_delay_min_ms", "tx_delay_max_ms")
+    @classmethod
+    def validate_delay(cls, value: int) -> int:
+        if not 0 <= value <= 3_600_000:
+            raise ValueError("transmit delays must be between 0 and 3600000")
+        return value
+
+    @model_validator(mode="after")
+    def validate_relationships(self) -> "PacketBridgeConfig":
+        if self.enabled:
+            if not self.link_id:
+                raise ValueError("link_id must not be empty when bridge is enabled")
+            if not self.endpoint_id:
+                raise ValueError("endpoint_id must not be empty when bridge is enabled")
+        if len(self.peer_ids) != len(set(self.peer_ids)):
+            raise ValueError("peer_ids must be unique")
+        if self.endpoint_id and self.endpoint_id in self.peer_ids:
+            raise ValueError("endpoint_id cannot occur in peer_ids")
+        if self.tx_delay_min_ms > self.tx_delay_max_ms:
+            raise ValueError("tx_delay_min_ms must be <= tx_delay_max_ms")
+        if self.dedup_db.strip() == "":
+            raise ValueError("dedup_db must not be empty")
+        return self
+
+
 class Config(BaseModel):
     """Main application configuration."""
 
     mqtt: MQTTConfig
     meshcore: MeshCoreConfig
+    packet_bridge: Optional[PacketBridgeConfig] = None
     log_level: str = Field(default="INFO", description="Logging level")
+
+    @model_validator(mode="after")
+    def validate_packet_bridge(self) -> "Config":
+        """Apply cross-section bridge requirements."""
+        if self.packet_bridge and self.packet_bridge.enabled:
+            if self.meshcore.connection_type != ConnectionType.SERIAL:
+                raise ValueError(
+                    "packet bridging requires meshcore connection_type: serial"
+                )
+            if "RX_LOG_DATA" not in self.meshcore.events:
+                self.meshcore.events.append("RX_LOG_DATA")
+        return self
 
     @field_validator("log_level")
     @classmethod
@@ -278,8 +398,32 @@ class Config(BaseModel):
             message_send_delay=float(os.getenv("MESHCORE_MESSAGE_SEND_DELAY", "15.0")),
         )
 
+        bridge_enabled_env = os.getenv("PACKET_BRIDGE_ENABLED")
+        peer_ids_env = os.getenv("PACKET_BRIDGE_PEER_IDS")
+        packet_bridge = None
+        if bridge_enabled_env is not None:
+            packet_bridge = PacketBridgeConfig(
+                enabled=bridge_enabled_env.lower() in {"1", "true", "yes", "on"},
+                link_id=os.getenv("PACKET_BRIDGE_LINK_ID", ""),
+                endpoint_id=os.getenv("PACKET_BRIDGE_ENDPOINT_ID", ""),
+                peer_ids=peer_ids_env.split(",") if peer_ids_env else [],
+                envelope_ttl_ms=int(
+                    os.getenv("PACKET_BRIDGE_ENVELOPE_TTL_MS", "30000")
+                ),
+                dedup_ttl_ms=int(os.getenv("PACKET_BRIDGE_DEDUP_TTL_MS", "120000")),
+                dedup_db=os.getenv("PACKET_BRIDGE_DEDUP_DB", "packet-bridge.sqlite3"),
+                max_queue=int(os.getenv("PACKET_BRIDGE_MAX_QUEUE", "128")),
+                max_bridge_hops=int(os.getenv("PACKET_BRIDGE_MAX_HOPS", "2")),
+                transmit_priority=int(
+                    os.getenv("PACKET_BRIDGE_TRANSMIT_PRIORITY", "0")
+                ),
+                tx_delay_min_ms=int(os.getenv("PACKET_BRIDGE_TX_DELAY_MIN_MS", "3000")),
+                tx_delay_max_ms=int(os.getenv("PACKET_BRIDGE_TX_DELAY_MAX_MS", "5000")),
+            )
+
         return cls(
             mqtt=mqtt_config,
             meshcore=meshcore_config,
+            packet_bridge=packet_bridge,
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )

@@ -15,10 +15,12 @@ class MessageType(Enum):
     MESHCORE_MESSAGE = "meshcore_message"
     MESHCORE_STATUS = "meshcore_status"
     MESHCORE_EVENT = "meshcore_event"
+    MESHCORE_RAW_PACKET = "meshcore_raw_packet"
 
     # MQTT to MeshCore
     MQTT_COMMAND = "mqtt_command"
     MQTT_STATUS = "mqtt_status"
+    MQTT_RAW_PACKET = "mqtt_raw_packet"
 
     # Control messages
     SHUTDOWN = "shutdown"

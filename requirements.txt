@@ -3,3 +3,4 @@ click==8.2.2
 pydantic==2.11.7
 meshcore==2.0.4
 PyYAML==6.0.2
+cbor2==5.6.5
