@@ -84,6 +84,7 @@ subscriptions are created. Enabling it requires `meshcore.connection_type: seria
 and companion firmware supporting command `65` (`CMD_SEND_RAW_PACKET`).
 
 - `enabled`: Enable packet bridge
+- `topic_root`: Dedicated MQTT root for bridge traffic (default: `meshcore/bridge`)
 - `link_id`: Shared MQTT bridge link identifier
 - `endpoint_id`: Local endpoint identifier
 - `peer_ids`: Exact reciprocal peer endpoint IDs
@@ -176,6 +177,7 @@ export MESHCORE_MESSAGE_INITIAL_DELAY=15.0
 export MESHCORE_MESSAGE_SEND_DELAY=15.0
 export MESHCORE_EVENTS="CONNECTED,DISCONNECTED,BATTERY,DEVICE_INFO"
 export PACKET_BRIDGE_ENABLED=true
+export PACKET_BRIDGE_TOPIC_ROOT=meshcore/bridge
 export PACKET_BRIDGE_LINK_ID=backhaul-1
 export PACKET_BRIDGE_ENDPOINT_ID=a
 export PACKET_BRIDGE_PEER_IDS=b
@@ -246,6 +248,19 @@ durably deduplicated, delayed by the configured jitter window, then sent unchang
 command `65` bytes: `0x41 | priority | serialized_packet`. Bridge messages always use
 QoS `1` and `retain=False`, regardless of general MQTT settings. Native RF arrival
 during delay cancels MQTT injection.
+
+To observe bridge traffic, enable the bridge and subscribe to the dedicated root:
+
+```bash
+export PACKET_BRIDGE_ENABLED=true
+mosquitto_sub -h localhost -v -t 'meshcore/bridge/v1/+/+/tx'
+```
+
+The payload is binary CBOR, so a successful packet appears as a message on the
+directional endpoint topic rather than as decoded JSON. The application logs the
+publish topic and packet length at `INFO` level. If no publish log appears, use
+`LOG_LEVEL=DEBUG` and verify that `RX_LOG_DATA` is being received from the serial
+companion.
 
 #### BLE Connection
 ```bash

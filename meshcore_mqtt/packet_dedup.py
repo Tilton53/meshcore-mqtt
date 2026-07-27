@@ -54,7 +54,8 @@ class PacketDedupStore:
             self._ensure_open()
             self._prune_locked(now_ms)
             cursor = self._connection.execute(
-                f"INSERT OR IGNORE INTO {table} ({key_column}, seen_at_ms) VALUES (?, ?)",
+                f"INSERT OR IGNORE INTO {table} ({key_column}, seen_at_ms) "
+                "VALUES (?, ?)",
                 (key, now_ms),
             )
             self._connection.commit()

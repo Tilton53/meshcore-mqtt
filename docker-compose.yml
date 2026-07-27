@@ -31,6 +31,7 @@ services:
 
       # Optional raw packet bridge. Set reciprocal endpoint and peer IDs per instance.
       - PACKET_BRIDGE_ENABLED=false
+      - PACKET_BRIDGE_TOPIC_ROOT=meshcore/bridge
       - PACKET_BRIDGE_LINK_ID=backhaul-1
       - PACKET_BRIDGE_ENDPOINT_ID=a
       - PACKET_BRIDGE_PEER_IDS=b

@@ -1251,6 +1251,9 @@ class MeshCoreWorker:
                 raise ValueError("payload is not hexadecimal text or bytes")
             if not packet:
                 raise ValueError("payload is empty")
+            self.logger.info(
+                "Received RX_LOG_DATA packet for bridging (%d bytes)", len(packet)
+            )
             packet_hash = packet_sha256(packet)
 
             # Native RF arrival wins over a pending MQTT transmission.

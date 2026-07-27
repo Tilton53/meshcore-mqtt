@@ -295,6 +295,7 @@ class BridgeCoordinator:
         )
         return {
             "enabled": True,
+            "topic_root": bridge_config.topic_root,
             "link_id": bridge_config.link_id,
             "endpoint_id": bridge_config.endpoint_id,
             "peer_ids": list(bridge_config.peer_ids),

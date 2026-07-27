@@ -1,6 +1,7 @@
 """Focused tests for raw packet bridge wire and durable state."""
 
 import time
+from pathlib import Path
 
 import cbor2
 import pytest
@@ -55,18 +56,20 @@ def test_envelope_expiry_future_and_trace_checks() -> None:
 
 
 def test_topic_and_command_contract() -> None:
-    assert bridge_topic("meshcore", "backhaul-1", "a") == (
+    assert bridge_topic("meshcore/bridge", "backhaul-1", "a") == (
         "meshcore/bridge/v1/backhaul-1/a/tx"
     )
     with pytest.raises(BridgeEnvelopeError):
-        bridge_topic("meshcore", "bad/segment", "a")
+        bridge_topic("meshcore/bridge", "bad/segment", "a")
+    with pytest.raises(BridgeEnvelopeError):
+        bridge_topic("meshcore/+", "backhaul-1", "a")
     assert build_send_raw_packet_command(b"abc", 7) == b"\x41\x07abc"
     assert packet_sha256(b"abc") == (
         "ba7816bf8f01cfea414140de5dae2223" "b00361a396177a9cb410ff61f20015ad"
     )
 
 
-def test_dedup_survives_reopen(tmp_path) -> None:
+def test_dedup_survives_reopen(tmp_path: Path) -> None:
     path = tmp_path / "dedup.sqlite3"
     envelope_id = bytes(range(16))
     packet = b"packet-bytes"

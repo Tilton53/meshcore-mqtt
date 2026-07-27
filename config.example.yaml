@@ -25,12 +25,13 @@ meshcore:
     - DEVICE_INFO
     - BATTERY
     - NEW_CONTACT
-      - ADVERTISEMENT
+    - ADVERTISEMENT
 
 # Optional raw packet bridge. Requires serial MeshCore connection.
 # Configure reciprocal peer_ids and a unique dedup_db on each instance.
 packet_bridge:
   enabled: false
+  topic_root: meshcore/bridge
   link_id: backhaul-1
   endpoint_id: a
   peer_ids:

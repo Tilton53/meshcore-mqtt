@@ -31,6 +31,7 @@
   },
   "packet_bridge": {
     "enabled": false,
+    "topic_root": "meshcore/bridge",
     "link_id": "backhaul-1",
     "endpoint_id": "a",
     "peer_ids": ["b"],

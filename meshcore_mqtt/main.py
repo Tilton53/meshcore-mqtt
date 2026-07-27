@@ -8,7 +8,12 @@ from typing import Optional
 
 import click
 
-from .config import Config, ConnectionType, PacketBridgeConfig
+from .config import (
+    PACKET_BRIDGE_DEFAULT_TOPIC_ROOT,
+    Config,
+    ConnectionType,
+    PacketBridgeConfig,
+)
 
 
 def setup_logging(level: str) -> None:
@@ -153,6 +158,11 @@ def setup_logging(level: str) -> None:
 )
 @click.option("--packet-bridge-link-id", default=None, help="Packet bridge link ID")
 @click.option(
+    "--packet-bridge-topic-root",
+    default=None,
+    help="Dedicated MQTT root topic for raw packet bridge traffic",
+)
+@click.option(
     "--packet-bridge-endpoint-id", default=None, help="Local packet bridge endpoint ID"
 )
 @click.option(
@@ -259,6 +269,7 @@ def main(
     meshcore_events: Optional[str],
     packet_bridge_enabled: Optional[bool],
     packet_bridge_link_id: Optional[str],
+    packet_bridge_topic_root: Optional[str],
     packet_bridge_endpoint_id: Optional[str],
     packet_bridge_peer_ids: Optional[str],
     packet_bridge_envelope_ttl_ms: Optional[int],
@@ -353,6 +364,8 @@ def main(
             if packet_bridge_enabled is not None:
                 config.packet_bridge = PacketBridgeConfig(
                     enabled=packet_bridge_enabled,
+                    topic_root=packet_bridge_topic_root
+                    or PACKET_BRIDGE_DEFAULT_TOPIC_ROOT,
                     link_id=packet_bridge_link_id or "",
                     endpoint_id=packet_bridge_endpoint_id or "",
                     peer_ids=(
@@ -407,6 +420,7 @@ def main(
             for option in (
                 packet_bridge_enabled,
                 packet_bridge_link_id,
+                packet_bridge_topic_root,
                 packet_bridge_endpoint_id,
                 packet_bridge_peer_ids,
                 packet_bridge_envelope_ttl_ms,
@@ -426,6 +440,10 @@ def main(
                     packet_bridge_enabled
                     if packet_bridge_enabled is not None
                     else (current.enabled if current else True)
+                ),
+                topic_root=packet_bridge_topic_root
+                or (
+                    current.topic_root if current else PACKET_BRIDGE_DEFAULT_TOPIC_ROOT
                 ),
                 link_id=packet_bridge_link_id or (current.link_id if current else ""),
                 endpoint_id=packet_bridge_endpoint_id

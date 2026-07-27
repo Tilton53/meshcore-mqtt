@@ -34,13 +34,21 @@ def validate_path_segment(value: Any, name: str = "segment") -> str:
     return value
 
 
-def bridge_topic(topic_prefix: str, link_id: str, endpoint_id: str) -> str:
-    """Construct exact directional bridge topic."""
+def bridge_topic(topic_root: str, link_id: str, endpoint_id: str) -> str:
+    """Construct an exact directional topic below the dedicated bridge root."""
     validate_path_segment(link_id, "link_id")
     validate_path_segment(endpoint_id, "endpoint_id")
-    if not isinstance(topic_prefix, str) or not topic_prefix.strip():
-        raise BridgeEnvelopeError("topic_prefix must be non-empty")
-    return f"{topic_prefix.rstrip('/')}/bridge/v1/{link_id}/{endpoint_id}/tx"
+    if not isinstance(topic_root, str) or not topic_root.strip():
+        raise BridgeEnvelopeError("topic_root must be non-empty")
+    topic_root = topic_root.strip().strip("/")
+    if not topic_root or any(char in {"+", "#"} for char in topic_root):
+        raise BridgeEnvelopeError("topic_root contains an MQTT wildcard")
+    segments = topic_root.split("/")
+    if any(not segment for segment in segments):
+        raise BridgeEnvelopeError("topic_root contains an empty path segment")
+    if any(any(char.isspace() for char in segment) for segment in segments):
+        raise BridgeEnvelopeError("topic_root cannot contain whitespace")
+    return f"{topic_root}/v1/{link_id}/{endpoint_id}/tx"
 
 
 def packet_sha256(packet: bytes) -> str:
@@ -200,9 +208,9 @@ class BridgeEnvelope:
 
 
 def validate_topic_source(
-    topic: str, topic_prefix: str, link_id: str, source: str
+    topic: str, topic_root: str, link_id: str, source: str
 ) -> None:
     """Require envelope source to match exact peer topic endpoint."""
-    expected = bridge_topic(topic_prefix, link_id, source)
+    expected = bridge_topic(topic_root, link_id, source)
     if topic != expected:
         raise BridgeEnvelopeError("envelope source does not match MQTT topic")

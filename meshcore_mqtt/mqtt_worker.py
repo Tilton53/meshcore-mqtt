@@ -82,10 +82,21 @@ class MQTTWorker:
             )
             self._bridge_topics = {
                 bridge_topic(
-                    config.mqtt.topic_prefix, bridge_config.link_id, peer
+                    bridge_config.topic_root, bridge_config.link_id, peer
                 ): peer
                 for peer in bridge_config.peer_ids
             }
+            publish_topic = bridge_topic(
+                bridge_config.topic_root,
+                bridge_config.link_id,
+                bridge_config.endpoint_id,
+            )
+            self.logger.info(
+                "Raw packet bridge enabled: publishing local packets to %s; "
+                "subscribing to %s",
+                publish_topic,
+                sorted(self._bridge_topics) or "no peer topics",
+            )
 
     async def start(self) -> None:
         """Start the MQTT worker."""
@@ -364,12 +375,17 @@ class MQTTWorker:
             return
         bridge_config = self.config.packet_bridge
         topic = bridge_topic(
-            self.config.mqtt.topic_prefix,
+            bridge_config.topic_root,
             bridge_config.link_id,
             bridge_config.endpoint_id,
         )
         if await self._safe_mqtt_publish(topic, envelope.encode(), retain=False, qos=1):
             self._bridge_stats["published"] += 1
+            self.logger.info(
+                "Published raw packet to bridge topic %s (%d bytes)",
+                topic,
+                len(envelope.packet),
+            )
         else:
             self._bridge_stats["publish_dropped"] += 1
 
@@ -843,7 +859,7 @@ class MQTTWorker:
             )
             validate_topic_source(
                 message.topic,
-                self.config.mqtt.topic_prefix,
+                bridge_config.topic_root,
                 bridge_config.link_id,
                 envelope.src,
             )

@@ -4,13 +4,14 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, cast
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MQTT_PATH_SEGMENT_INVALID = {"/", "+", "#"}
 PACKET_BRIDGE_MAX_PACKET_SIZE = 176
+PACKET_BRIDGE_DEFAULT_TOPIC_ROOT = "meshcore/bridge"
 
 
 class ConnectionType(str, Enum):
@@ -187,6 +188,10 @@ class PacketBridgeConfig(BaseModel):
     """Optional raw MeshCore packet bridge configuration."""
 
     enabled: bool = Field(default=True, description="Enable packet bridging")
+    topic_root: str = Field(
+        default=PACKET_BRIDGE_DEFAULT_TOPIC_ROOT,
+        description="Dedicated MQTT root topic for raw packet bridging",
+    )
     link_id: str = Field(default="", description="Shared bridge link identifier")
     endpoint_id: str = Field(default="", description="Local bridge endpoint identifier")
     peer_ids: List[str] = Field(default_factory=list)
@@ -198,6 +203,24 @@ class PacketBridgeConfig(BaseModel):
     transmit_priority: int = Field(default=0)
     tx_delay_min_ms: int = Field(default=3_000)
     tx_delay_max_ms: int = Field(default=5_000)
+
+    @field_validator("topic_root", mode="before")
+    @classmethod
+    def normalize_topic_root(cls, value: Any) -> str:
+        """Normalize and validate the dedicated MQTT topic root."""
+        if not isinstance(value, str):
+            raise ValueError("topic_root must be a string")
+        value = value.strip().strip("/")
+        if not value:
+            raise ValueError("topic_root must not be empty")
+        if any(char in value for char in {"+", "#"}):
+            raise ValueError("topic_root cannot contain MQTT wildcards")
+        segments = value.split("/")
+        if any(not segment for segment in segments):
+            raise ValueError("topic_root cannot contain empty path segments")
+        if any(any(char.isspace() for char in segment) for segment in segments):
+            raise ValueError("topic_root cannot contain whitespace")
+        return cast(str, value)
 
     @field_validator("link_id", "endpoint_id", mode="before")
     @classmethod
@@ -404,6 +427,9 @@ class Config(BaseModel):
         if bridge_enabled_env is not None:
             packet_bridge = PacketBridgeConfig(
                 enabled=bridge_enabled_env.lower() in {"1", "true", "yes", "on"},
+                topic_root=os.getenv(
+                    "PACKET_BRIDGE_TOPIC_ROOT", PACKET_BRIDGE_DEFAULT_TOPIC_ROOT
+                ),
                 link_id=os.getenv("PACKET_BRIDGE_LINK_ID", ""),
                 endpoint_id=os.getenv("PACKET_BRIDGE_ENDPOINT_ID", ""),
                 peer_ids=peer_ids_env.split(",") if peer_ids_env else [],
