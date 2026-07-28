@@ -119,6 +119,23 @@ class MeshCoreWorker:
             self._bridge_store = PacketDedupStore(
                 bridge_config.dedup_db, bridge_config.dedup_ttl_ms
             )
+            self.logger.info(
+                "MeshCore raw packet bridge state: enabled=True topic_root=%s "
+                "link_id=%s endpoint_id=%s peer_ids=%s",
+                bridge_config.topic_root,
+                bridge_config.link_id,
+                bridge_config.endpoint_id,
+                bridge_config.peer_ids,
+            )
+        elif bridge_config is None:
+            self.logger.info(
+                "MeshCore raw packet bridge state: disabled "
+                "(packet_bridge is absent)"
+            )
+        else:
+            self.logger.info(
+                "MeshCore raw packet bridge state: disabled by configuration"
+            )
         self._pending_injections: Dict[str, PendingPacketInjection] = {}
         self._pending_wakeup = asyncio.Event()
         self._bridge_stats: Dict[str, int] = {
@@ -1200,9 +1217,13 @@ class MeshCoreWorker:
                 # Don't forward NO_MORE_MSGS to MQTT as it's internal
                 return
 
-            if event_name == "RX_LOG_DATA" and self._bridge_enabled:
-                self._handle_bridge_rx_event(event_data)
-                return
+            if event_name == "RX_LOG_DATA":
+                self.logger.info(
+                    "RX_LOG_DATA bridge dispatch: enabled=%s", self._bridge_enabled
+                )
+                if self._bridge_enabled:
+                    self._handle_bridge_rx_event(event_data)
+                    return
 
             # Add extra logging for connection events to help debug
             if event_name in ["CONNECTED", "DISCONNECTED"]:

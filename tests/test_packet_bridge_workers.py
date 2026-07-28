@@ -1,4 +1,4 @@
-e"""Worker-level packet bridge behavior tests."""
+"""Worker-level packet bridge behavior tests."""
 
 from pathlib import Path
 from types import SimpleNamespace

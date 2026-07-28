@@ -97,6 +97,12 @@ class MQTTWorker:
                 publish_topic,
                 sorted(self._bridge_topics) or "no peer topics",
             )
+        elif bridge_config is None:
+            self.logger.info(
+                "MQTT raw packet bridge state: disabled " "(packet_bridge is absent)"
+            )
+        else:
+            self.logger.info("MQTT raw packet bridge state: disabled by configuration")
 
     async def start(self) -> None:
         """Start the MQTT worker."""

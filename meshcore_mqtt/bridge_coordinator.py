@@ -49,6 +49,22 @@ class BridgeCoordinator:
 
         try:
             # Initialize workers
+            bridge_config = self.config.packet_bridge
+            if bridge_config is None:
+                self.logger.info(
+                    "Effective raw packet bridge configuration: disabled "
+                    "(packet_bridge is absent)"
+                )
+            else:
+                self.logger.info(
+                    "Effective raw packet bridge configuration: enabled=%s "
+                    "topic_root=%s link_id=%s endpoint_id=%s peer_ids=%s",
+                    bridge_config.enabled,
+                    bridge_config.topic_root,
+                    bridge_config.link_id,
+                    bridge_config.endpoint_id,
+                    bridge_config.peer_ids,
+                )
             self.meshcore_worker = MeshCoreWorker(self.config)
             self.mqtt_worker = MQTTWorker(self.config)
 
