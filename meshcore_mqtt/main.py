@@ -299,6 +299,11 @@ def main(
         # 1. Command line arguments (highest priority)
         # 2. Configuration file
         # 3. Environment variables (lowest priority)
+        click_context = click.get_current_context()
+        packet_bridge_enabled_provided = (
+            click_context.get_parameter_source("packet_bridge_enabled")
+            != click.core.ParameterSource.DEFAULT
+        )
 
         if config_file:
             config = Config.from_file(config_file)
@@ -361,7 +366,8 @@ def main(
                 log_level=log_level,
             )
 
-            if packet_bridge_enabled is not None:
+            if packet_bridge_enabled_provided:
+                assert packet_bridge_enabled is not None
                 config.packet_bridge = PacketBridgeConfig(
                     enabled=packet_bridge_enabled,
                     topic_root=packet_bridge_topic_root
@@ -416,31 +422,32 @@ def main(
             config.meshcore.events = Config.parse_events_string(meshcore_events)
 
         bridge_options_provided = any(
-            option is not None
-            for option in (
-                packet_bridge_enabled,
-                packet_bridge_link_id,
-                packet_bridge_topic_root,
-                packet_bridge_endpoint_id,
-                packet_bridge_peer_ids,
-                packet_bridge_envelope_ttl_ms,
-                packet_bridge_dedup_ttl_ms,
-                packet_bridge_dedup_db,
-                packet_bridge_max_queue,
-                packet_bridge_max_hops,
-                packet_bridge_transmit_priority,
-                packet_bridge_tx_delay_min_ms,
-                packet_bridge_tx_delay_max_ms,
+            option_provided
+            for option_provided in (
+                packet_bridge_enabled_provided,
+                packet_bridge_link_id is not None,
+                packet_bridge_topic_root is not None,
+                packet_bridge_endpoint_id is not None,
+                packet_bridge_peer_ids is not None,
+                packet_bridge_envelope_ttl_ms is not None,
+                packet_bridge_dedup_ttl_ms is not None,
+                packet_bridge_dedup_db is not None,
+                packet_bridge_max_queue is not None,
+                packet_bridge_max_hops is not None,
+                packet_bridge_transmit_priority is not None,
+                packet_bridge_tx_delay_min_ms is not None,
+                packet_bridge_tx_delay_max_ms is not None,
             )
         )
         if bridge_options_provided:
             current = config.packet_bridge
+            if packet_bridge_enabled_provided:
+                assert packet_bridge_enabled is not None
+                effective_bridge_enabled = packet_bridge_enabled
+            else:
+                effective_bridge_enabled = current.enabled if current else True
             config.packet_bridge = PacketBridgeConfig(
-                enabled=(
-                    packet_bridge_enabled
-                    if packet_bridge_enabled is not None
-                    else (current.enabled if current else True)
-                ),
+                enabled=effective_bridge_enabled,
                 topic_root=packet_bridge_topic_root
                 or (
                     current.topic_root if current else PACKET_BRIDGE_DEFAULT_TOPIC_ROOT
